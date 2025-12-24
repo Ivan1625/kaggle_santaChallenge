@@ -24,7 +24,6 @@ NUM_VERTS = len(TREE_X)
 
 @njit(cache=True)
 def transform_poly(x, y, rot_deg, out_x, out_y):
-    """Transforms polygon vertices based on x, y, rotation."""
     rad = np.radians(rot_deg)
     cos_a = np.cos(rad)
     sin_a = np.sin(rad)
@@ -47,7 +46,6 @@ def get_bounds(px, py):
 
 @njit(cache=True)
 def is_point_in_poly(px, py, poly_x, poly_y):
-    """Ray casting point-in-poly check."""
     inside = False
     j = NUM_VERTS - 2 
     for i in range(NUM_VERTS - 1):
@@ -59,25 +57,15 @@ def is_point_in_poly(px, py, poly_x, poly_y):
 
 @njit(cache=True)
 def segments_intersect(a1x, a1y, a2x, a2y, b1x, b1y, b2x, b2y):
-    """
-    Strict segment intersection. 
-    Returns True if segments cross or touch within epsilon.
-    """
     def cross(ax, ay, bx, by): return ax*by - ay*bx
     r_x = a2x - a1x; r_y = a2y - a1y
     s_x = b2x - b1x; s_y = b2y - b1y
     denom = cross(r_x, r_y, s_x, s_y)
-    
-    if np.abs(denom) < 1e-12: return False # Parallel
-    
+    if np.abs(denom) < 1e-12: return False
     u_numer = cross(b1x - a1x, b1y - a1y, r_x, r_y)
     t_numer = cross(b1x - a1x, b1y - a1y, s_x, s_y)
-    
     u = u_numer / denom
     t = t_numer / denom
-    
-    # Epsilon for strict collision
-    # We treat touching (t approx 0 or 1) as collision to be safe
     eps = 1e-9
     if (t > -eps) and (t < 1.0 + eps) and (u > -eps) and (u < 1.0 + eps):
         return True
@@ -85,29 +73,15 @@ def segments_intersect(a1x, a1y, a2x, a2y, b1x, b1y, b2x, b2y):
 
 @njit(cache=True)
 def check_poly_overlap(p1x, p1y, p2x, p2y, safety_margin):
-    """
-    Checks if two polygons overlap.
-    Includes a 'safety_margin' to ensure they stay slightly apart.
-    """
-    # 1. Bounding Box (with margin)
     minx1, miny1, maxx1, maxy1 = get_bounds(p1x, p1y)
     minx2, miny2, maxx2, maxy2 = get_bounds(p2x, p2y)
-    
-    # If boxes don't overlap (plus margin), polygons definitely don't
     if (minx1 > maxx2 + safety_margin or maxx1 < minx2 - safety_margin or 
         miny1 > maxy2 + safety_margin or maxy1 < miny2 - safety_margin):
         return False
-        
-    # 2. Vertices in Polygon
-    # Check p1 verts in p2
     for i in range(NUM_VERTS - 1):
         if is_point_in_poly(p1x[i], p1y[i], p2x, p2y): return True
-    # Check p2 verts in p1
     for i in range(NUM_VERTS - 1):
         if is_point_in_poly(p2x[i], p2y[i], p1x, p1y): return True
-        
-    # 3. Edge Intersections
-    # This catches "crossing" without vertex containment
     for i in range(NUM_VERTS - 1):
         for j in range(NUM_VERTS - 1):
             if segments_intersect(p1x[i], p1y[i], p1x[i+1], p1y[i+1],
@@ -117,7 +91,6 @@ def check_poly_overlap(p1x, p1y, p2x, p2y, safety_margin):
 
 @njit(cache=True)
 def get_system_score_raw(xs, ys, rots, n, temp_cache_x, temp_cache_y):
-    """Returns Side^2 (Area) of the bounding square."""
     g_minx, g_miny = 1e9, 1e9
     g_maxx, g_maxy = -1e9, -1e9
     for i in range(n):
@@ -138,19 +111,13 @@ def get_system_score_raw(xs, ys, rots, n, temp_cache_x, temp_cache_y):
 
 @njit(cache=True)
 def run_strict_sa(xs, ys, rots, n, iterations, start_temp, cooling_rate, squeeze_factor, squeeze_freq, safety_margin):
-    # Pre-allocate polygon caches
     cache_x = np.zeros((n, 16), dtype=np.float64)
     cache_y = np.zeros((n, 16), dtype=np.float64)
-    
-    # Initialize Geometry
     for i in range(n):
         transform_poly(xs[i], ys[i], rots[i], cache_x[i], cache_y[i])
         
-    # Initial Score
     current_area = get_system_score_raw(xs, ys, rots, n, cache_x, cache_y)
     best_area = current_area
-    
-    # Backups
     best_xs = xs.copy()
     best_ys = ys.copy()
     best_rots = rots.copy()
@@ -169,30 +136,22 @@ def run_strict_sa(xs, ys, rots, n, iterations, start_temp, cooling_rate, squeeze
     cx = (g_minx + g_maxx) / 2
     cy = (g_miny + g_maxy) / 2
 
-    # Loop
     for k in range(iterations):
-        
-        # --- TYPE 1: TRY SQUEEZE (Hydraulic Press) ---
-        # Only applied if VALID. Does not force overlaps.
+        # 1. HYDRAULIC PRESS (Squeeze)
         did_squeeze = False
         if k % squeeze_freq == 0:
-            # Try to squeeze ALL items
             saved_xs = xs.copy()
             saved_ys = ys.copy()
-            
             squeeze_valid = True
             
-            # Update positions
+            # Pull towards center
             for i in range(n):
                 xs[i] = cx + (xs[i] - cx) * squeeze_factor
                 ys[i] = cy + (ys[i] - cy) * squeeze_factor
             
-            # Check validity of squeezed state
-            # We must update temp geom to check
+            # Check validity
             for i in range(n):
                 transform_poly(xs[i], ys[i], rots[i], cache_x[i], cache_y[i])
-            
-            # All-vs-All Check
             for i in range(n):
                 for j in range(i+1, n):
                     if check_poly_overlap(cache_x[i], cache_y[i], cache_x[j], cache_y[j], safety_margin):
@@ -201,7 +160,6 @@ def run_strict_sa(xs, ys, rots, n, iterations, start_temp, cooling_rate, squeeze
                 if not squeeze_valid: break
             
             if squeeze_valid:
-                # Keep squeeze
                 did_squeeze = True
                 current_area = get_system_score_raw(xs, ys, rots, n, cache_x, cache_y)
                 if current_area < best_area:
@@ -210,57 +168,49 @@ def run_strict_sa(xs, ys, rots, n, iterations, start_temp, cooling_rate, squeeze
                     best_ys = ys.copy()
                     best_rots = rots.copy()
             else:
-                # Revert squeeze
+                # Revert
                 xs[:] = saved_xs[:]
                 ys[:] = saved_ys[:]
-                # Restore cache
                 for i in range(n):
                     transform_poly(xs[i], ys[i], rots[i], cache_x[i], cache_y[i])
 
-        # --- TYPE 2: PERTURBATION (Random Move) ---
-        # If we didn't squeeze (or squeeze failed), try a standard move
+        # 2. PERTURBATION
         if not did_squeeze:
             idx = np.random.randint(0, n)
             old_x, old_y, old_rot = xs[idx], ys[idx], rots[idx]
             
             rnd = np.random.random()
-            # Dynamic magnitude
             mag = max(0.00000001, temp * 0.05) 
             
-            if rnd < 0.5: # Translate
+            if rnd < 0.5: 
                 xs[idx] += np.random.normal(0, mag)
                 ys[idx] += np.random.normal(0, mag)
-            elif rnd < 0.9: # Rotate
+            elif rnd < 0.9: 
                 rots[idx] += np.random.normal(0, mag * 50.0) 
-            else: # Small Jump
+            else: 
+                # Larger jumps to fix bad packing
                 if temp > 1.0:
                     xs[idx] += np.random.normal(0, 0.5)
                     ys[idx] += np.random.normal(0, 0.5)
                     rots[idx] = np.random.uniform(0, 360)
 
-            # Temp geometry
             tx = np.zeros(16, dtype=np.float64)
             ty = np.zeros(16, dtype=np.float64)
             transform_poly(xs[idx], ys[idx], rots[idx], tx, ty)
             
-            # CHECK VALIDITY (Hard Constraint)
             valid = True
             for j in range(n):
                 if idx == j: continue
-                # Check against cached others
                 if check_poly_overlap(tx, ty, cache_x[j], cache_y[j], safety_margin):
                     valid = False
                     break
             
             if valid:
-                # Commit to cache
                 cache_x[idx] = tx
                 cache_y[idx] = ty
-                
                 new_area = get_system_score_raw(xs, ys, rots, n, cache_x, cache_y)
                 delta = new_area - current_area
                 
-                # Metropolis
                 if delta < 0 or np.random.random() < np.exp(-delta / temp):
                     current_area = new_area
                     if current_area < best_area:
@@ -269,25 +219,22 @@ def run_strict_sa(xs, ys, rots, n, iterations, start_temp, cooling_rate, squeeze
                         best_ys = ys.copy()
                         best_rots = rots.copy()
                 else:
-                    # Revert choice
                     xs[idx] = old_x
                     ys[idx] = old_y
                     rots[idx] = old_rot
                     transform_poly(old_x, old_y, old_rot, cache_x[idx], cache_y[idx])
             else:
-                # Revert invalid
                 xs[idx] = old_x
                 ys[idx] = old_y
                 rots[idx] = old_rot
 
-        # Update Cooling
         temp *= cooling_rate
         if temp < 1e-12: temp = 1e-12
 
     return best_xs, best_ys, best_rots, best_area
 
 # ==========================================
-# 4. WRAPPER & SHAPELY VERIFICATION
+# 4. INITIALIZATION & WRAPPER
 # ==========================================
 
 def get_base_shapely_poly():
@@ -300,10 +247,7 @@ def get_base_shapely_poly():
 BASE_SHAPELY = get_base_shapely_poly()
 
 def verify_validity(xs, ys, rots):
-    """
-    Final Truth Check using Shapely.
-    Returns True if valid.
-    """
+    """Shapely verification."""
     polys = []
     n = len(xs)
     for i in range(n):
@@ -312,29 +256,50 @@ def verify_validity(xs, ys, rots):
         polys.append(p)
     
     for i in range(n):
-        # Buffer -1e-9 allows 'kissing' but not overlap
         p1 = polys[i].buffer(-1e-9) 
         for j in range(i+1, n):
             if p1.intersects(polys[j]):
                 return False
     return True
 
-def optimize_puzzle_strict(df_puzzle, params):
-    n = len(df_puzzle)
-    xs = np.ascontiguousarray(df_puzzle['x'].values, dtype=np.float64)
-    ys = np.ascontiguousarray(df_puzzle['y'].values, dtype=np.float64)
-    rots = np.ascontiguousarray(df_puzzle['deg'].values, dtype=np.float64)
+def generate_grid_initialization(n):
+    """
+    Generates a safe, dispersed grid layout.
+    """
+    xs = np.zeros(n, dtype=np.float64)
+    ys = np.zeros(n, dtype=np.float64)
+    rots = np.zeros(n, dtype=np.float64)
+    ids = [f"{n}_{i}" for i in range(n)]
     
-    # 1. Check Initial Validity
-    if not verify_validity(xs, ys, rots):
-        # If input has collisions, we cannot run Strict SA safely.
-        # Returning infinity score ensures we don't save this as a "Best"
-        return df_puzzle, float('inf')
+    # Calculate grid size
+    grid_side = math.ceil(math.sqrt(n))
+    spacing = 2.0  # Safe distance (Tree is ~1.0 high, 0.7 wide)
+    
+    for i in range(n):
+        row = i // grid_side
+        col = i % grid_side
+        
+        # Center the grid around 0,0 for easier squeezing
+        xs[i] = (col - grid_side/2) * spacing
+        ys[i] = (row - grid_side/2) * spacing
+        
+        # Random initial rotation
+        rots[i] = random.uniform(0, 360)
+        
+    return pd.DataFrame({'id': ids, 'x': xs, 'y': ys, 'deg': rots})
 
-    # Warmup Numba
-    if not hasattr(optimize_puzzle_strict, "compiled"):
+def optimize_from_scratch(n, params):
+    # 1. Generate Start State
+    df_init = generate_grid_initialization(n)
+    
+    xs = np.ascontiguousarray(df_init['x'].values, dtype=np.float64)
+    ys = np.ascontiguousarray(df_init['y'].values, dtype=np.float64)
+    rots = np.ascontiguousarray(df_init['deg'].values, dtype=np.float64)
+    
+    # JIT Warmup
+    if not hasattr(optimize_from_scratch, "compiled"):
         run_strict_sa(xs.copy(), ys.copy(), rots.copy(), n, 10, 0.1, 0.9, 1.0, 100, 1e-7)
-        optimize_puzzle_strict.compiled = True
+        optimize_from_scratch.compiled = True
         
     best_xs, best_ys, best_rots, best_raw_area = run_strict_sa(
         xs, ys, rots, n, 
@@ -346,14 +311,14 @@ def optimize_puzzle_strict(df_puzzle, params):
         safety_margin=params['SAFETY_MARGIN']
     )
     
-    # Final Double Check
+    # Final Check
     if not verify_validity(best_xs, best_ys, best_rots):
-        return df_puzzle, float('inf')
+        return None, float('inf')
     
     res_data = []
     for i in range(n):
         res_data.append({
-            'id': df_puzzle.iloc[i]['id'],
+            'id': df_init.iloc[i]['id'],
             'x': best_xs[i],
             'y': best_ys[i],
             'deg': best_rots[i]
@@ -364,108 +329,73 @@ def optimize_puzzle_strict(df_puzzle, params):
 
 def main():
     # =====================
-    # PARAMS
+    # CONFIGURATION
     # =====================
-    input_file = 'C:/Users/user/Downloads/sample_submission.csv'
-    output_file = 'C:/Users/user/Downloads/submission_no_collision.csv'
+    output_file = 'C:/Users/user/Downloads/submission_from_scratch.csv'
     
-    TARGET_PUZZLES = [16] # e.g. [16, 17]
-    LOOPS_PER_PUZZLE = 10
+    # WHICH N TO SOLVE?
+    TARGET_NS = [16] 
+    
+    # HOW MANY RESTARTS?
+    LOOPS_PER_N = 10
     
     PARAMS = {
-        'ITERATIONS': 200_000,    
-        'START_TEMP': 10.0,       
-        'COOLING_RATE': 0.99995,  
-        'SQUEEZE_FACTOR': 0.9995, 
-        'SQUEEZE_FREQ': 100,
-        'SAFETY_MARGIN': 1e-20  # Buffer to guarantee no collision
+        'ITERATIONS': 500_000,    # Increase because we start far apart
+        'START_TEMP': 5.0,       # High temp to bring them together fast
+        'COOLING_RATE': 0.99998,  # Slow cool for packing
+        'SQUEEZE_FACTOR': 0.999,  # Slightly more aggressive squeeze initally
+        'SQUEEZE_FREQ': 50,       # Frequent squeezing
+        'SAFETY_MARGIN': 1e-20
     }
-    
     # =====================
     
-    print(f"Reading {input_file}...")
-    df = pd.read_csv(input_file)
-    
-    for col in ['x', 'y', 'deg']:
-        if df[col].dtype == 'object':
-             df[col] = df[col].astype(str).str.replace('s', '', regex=False)
-        df[col] = pd.to_numeric(df[col])
-    
-    df['puzzle_n'] = df['id'].apply(lambda x: int(x.split('_')[0]))
-    
-    all_puzzles = df['puzzle_n'].unique()
-    if TARGET_PUZZLES:
-        puzzles_to_run = [p for p in all_puzzles if p in TARGET_PUZZLES]
-    else:
-        puzzles_to_run = all_puzzles
-        
     final_dfs = []
-    total_imp_global = 0.0
     
-    print(f"Optimizing {len(puzzles_to_run)} puzzles (Strict Mode)...")
+    print(f"Generating and Optimizing for N = {TARGET_NS}")
+    print(f"{'N':<5} | {'Loop':<5} | {'Best Score':<15} | {'Status'}")
+    print("-" * 50)
     
-    for n in tqdm(puzzles_to_run):
-        puzzle_df = df[df['puzzle_n'] == n].copy()
+    for n in TARGET_NS:
         
-        # Initial Score
-        # We need to calc initial area first
-        # (Assuming input is valid, if not, optimize_puzzle_strict returns inf anyway)
-        # Just use a dummy call to get score if valid
-        try:
-            # Quick calc
-            n_items = len(puzzle_df)
-            xs = puzzle_df['x'].values
-            ys = puzzle_df['y'].values
-            rots = puzzle_df['deg'].values
-            if verify_validity(xs, ys, rots):
-                 # Calc score
-                 # Reusing the Numba kernel for score calc needs arrays
-                 tx = np.zeros((n_items, 16)); ty = np.zeros((n_items, 16))
-                 raw_a = get_system_score_raw(xs.astype(np.float64), ys.astype(np.float64), rots.astype(np.float64), n_items, tx, ty)
-                 original_score = raw_a / n_items
+        best_df_for_n = None
+        best_score_for_n = float('inf')
+        
+        for i in range(LOOPS_PER_N):
+            # Run optimization from fresh random grid
+            opt_df, new_score = optimize_from_scratch(n, PARAMS)
+            
+            status = "Discarded"
+            if opt_df is not None:
+                if new_score < best_score_for_n:
+                    best_score_for_n = new_score
+                    best_df_for_n = opt_df
+                    status = "NEW BEST"
+                else:
+                    status = "Valid (Worse)"
             else:
-                 original_score = float('inf')
-                 tqdm.write(f"Puzzle {n} starting invalid (Collisions). Skipping...")
-        except:
-             original_score = float('inf')
-
-        if original_score == float('inf'):
-            final_dfs.append(puzzle_df)
-            continue
-
-        best_df_for_n = puzzle_df
-        best_score_for_n = original_score
-        
-        for i in range(LOOPS_PER_PUZZLE):
-            opt_df, new_score = optimize_puzzle_strict(puzzle_df.copy(), PARAMS)
-            
-            if new_score < best_score_for_n:
-                best_score_for_n = new_score
-                best_df_for_n = opt_df
-                # tqdm.write(f"Puzzle {n} Loop {i}: Improved to {new_score:.10f}")
+                status = "Invalid"
                 
-        final_dfs.append(best_df_for_n)
-        if best_score_for_n < original_score:
-            total_imp_global += (original_score - best_score_for_n)
-
-    # Add skipped
-    if TARGET_PUZZLES:
-        skipped = df[~df['puzzle_n'].isin(TARGET_PUZZLES)]
-        if not skipped.empty:
-            final_dfs.append(skipped)
+            print(f"{n:<5} | {i+1}/{LOOPS_PER_N} | {best_score_for_n:.8f}    | {status}")
             
-    final_df = pd.concat(final_dfs).sort_values('id')
-    
-    for col in ['x', 'y', 'deg']:
-        final_df[col] = final_df[col].apply(lambda x: f"s{x:.20f}")
+        if best_df_for_n is not None:
+            final_dfs.append(best_df_for_n)
+            print(f"--> Finished N={n}. Final Score: {best_score_for_n:.8f}\n")
+        else:
+            print(f"--> Failed to find valid solution for N={n} (Check params)\n")
+
+    # Save
+    if final_dfs:
+        final_df = pd.concat(final_dfs).sort_values('id')
         
-    final_df = final_df[['id', 'x', 'y', 'deg']]
-    final_df.to_csv(output_file, index=False)
-    
-    print("\n" + "="*30)
-    print(f"Best score for puzzle {n}: {best_score_for_n:.10f}")
-    print(f"Total Improvement: {total_imp_global:.10f}")
-    print(f"Saved to: {output_file}")
+        # Format
+        for col in ['x', 'y', 'deg']:
+            final_df[col] = final_df[col].apply(lambda x: f"s{x:.20f}")
+            
+        final_df = final_df[['id', 'x', 'y', 'deg']]
+        final_df.to_csv(output_file, index=False)
+        print(f"Saved to: {output_file}")
+    else:
+        print("No valid solutions found.")
 
 if __name__ == "__main__":
     main()
