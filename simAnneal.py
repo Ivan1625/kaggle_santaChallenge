@@ -1,401 +1,510 @@
-import numpy as np
+"""
+Christmas Tree Layout Optimization (Local Run Version)
+Core Functions:
+    1. Read Christmas tree parameters (group ID, coordinates, rotation angle) from local CSV
+    2. Run simulated annealing algorithm with multiprocessing to optimize layout per group
+    3. Optimization Goal: Minimize bounding box side length + No area overlap (edge/point contact only)
+    4. Auto-save progress periodically, support manual interruption with progress saving
+Dependencies: pip install pandas shapely
+"""
 import pandas as pd
-import math
-import random
-import time
-from numba import njit, prange, float64, int64, boolean
-from tqdm import tqdm
+from decimal import Decimal, getcontext
 from shapely import affinity
 from shapely.geometry import Polygon
+from shapely.strtree import STRtree
+import time
+import multiprocessing
+import math
+import random
+import os
+from traceback import format_exc
 
-# ==========================================
-# 1. GEOMETRY CONSTANTS
-# ==========================================
-# Exact Santa Tree Vertices
-TREE_X = np.array([0.0, 0.125, 0.0625, 0.2, 0.1, 0.35, 0.075, 0.075, 
-                   -0.075, -0.075, -0.35, -0.1, -0.2, -0.0625, -0.125, 0.0], dtype=np.float64)
-TREE_Y = np.array([0.8, 0.5, 0.5, 0.25, 0.25, 0.0, 0.0, -0.2, 
-                   -0.2, 0.0, 0.0, 0.25, 0.25, 0.5, 0.5, 0.8], dtype=np.float64)
-NUM_VERTS = len(TREE_X)
 
-# ==========================================
-# 2. NUMBA GEOMETRY KERNEL (STRICT)
-# ==========================================
+#scaled to avoid floating point errors
+getcontext().prec = 50 
+scale_factor = Decimal('1e18') 
 
-@njit(cache=True)
-def transform_poly(x, y, rot_deg, out_x, out_y):
-    rad = np.radians(rot_deg)
-    cos_a = np.cos(rad)
-    sin_a = np.sin(rad)
-    for i in range(NUM_VERTS):
-        tx = TREE_X[i] * cos_a - TREE_Y[i] * sin_a
-        ty = TREE_X[i] * sin_a + TREE_Y[i] * cos_a
-        out_x[i] = tx + x
-        out_y[i] = ty + y
+# --- Configuration Parameters ---
+# input output csv; max iter per grp; temp start/end; time limit hrs; save freq; chunk size
+INPUT_CSV = r"C:\Users\user\OneDrive\Desktop\Python Folder\kaggle\Scores\sample_submission.csv"
+OUTPUT_CSV = r"C:\Users\user\OneDrive\Desktop\Python Folder\kaggle\submission_sa (1).csv"  
+MAX_ITER_PER_GROUP = 500000  
+T_START = 3  
+T_END = 0.001  
+LOCAL_TIME_LIMIT_HOURS = 0  
+SAVE_EVERY_N_GROUPS = 50  
+CHUNKSIZE = 1 
 
-@njit(cache=True)
-def get_bounds(px, py):
-    minx, miny = 1e9, 1e9
-    maxx, maxy = -1e9, -1e9
-    for i in range(NUM_VERTS):
-        if px[i] < minx: minx = px[i]
-        if px[i] > maxx: maxx = px[i]
-        if py[i] < miny: miny = py[i]
-        if py[i] > maxy: maxy = py[i]
-    return minx, miny, maxx, maxy
+# --- Core Class: Christmas Tree Geometric Model ---
+class ChristmasTree:
+    def __init__(self, center_x='0', center_y='0', angle='0'):
+        """
+        Initialize Christmas Tree
+        :param center_x: Center x coordinate (string/number)
+        :param center_y: Center y coordinate (string/number)
+        :param angle: Rotation angle (degrees, string/number)
+        """
+        self.center_x = Decimal(center_x)
+        self.center_y = Decimal(center_y)
+        self.angle = Decimal(angle)
+        self.polygon = self._create_polygon()
 
-@njit(cache=True)
-def is_point_in_poly(px, py, poly_x, poly_y):
-    inside = False
-    j = NUM_VERTS - 2 
-    for i in range(NUM_VERTS - 1):
-        if ((poly_y[i] > py) != (poly_y[j] > py)):
-            if (px < (poly_x[j] - poly_x[i]) * (py - poly_y[i]) / (poly_y[j] - poly_y[i]) + poly_x[i]):
-                inside = not inside
-        j = i
-    return inside
+    def _create_polygon(self):
+        """Build Christmas tree polygon (trunk + 3 tiers), apply rotation + translation"""
+        # Christmas tree dimension parameters
+        trunk_w = Decimal('0.15'); trunk_h = Decimal('0.2')
+        base_w = Decimal('0.7'); base_y = Decimal('0.0')
+        mid_w = Decimal('0.4'); tier_2_y = Decimal('0.25')
+        top_w = Decimal('0.25'); tier_1_y = Decimal('0.5')
+        tip_y = Decimal('0.8'); trunk_bottom_y = -trunk_h
 
-@njit(cache=True)
-def segments_intersect(a1x, a1y, a2x, a2y, b1x, b1y, b2x, b2y):
-    def cross(ax, ay, bx, by): return ax*by - ay*bx
-    r_x = a2x - a1x; r_y = a2y - a1y
-    s_x = b2x - b1x; s_y = b2y - b1y
-    denom = cross(r_x, r_y, s_x, s_y)
-    if np.abs(denom) < 1e-12: return False
-    u_numer = cross(b1x - a1x, b1y - a1y, r_x, r_y)
-    t_numer = cross(b1x - a1x, b1y - a1y, s_x, s_y)
-    u = u_numer / denom
-    t = t_numer / denom
-    eps = 1e-9
-    if (t > -eps) and (t < 1.0 + eps) and (u > -eps) and (u < 1.0 + eps):
+        # Build initial polygon vertices (scale to avoid floating point errors)
+        initial_polygon = Polygon([
+            (Decimal('0.0') * scale_factor, tip_y * scale_factor),
+            (top_w / Decimal('2') * scale_factor, tier_1_y * scale_factor),
+            (top_w / Decimal('4') * scale_factor, tier_1_y * scale_factor),
+            (mid_w / Decimal('2') * scale_factor, tier_2_y * scale_factor),
+            (mid_w / Decimal('4') * scale_factor, tier_2_y * scale_factor),
+            (base_w / Decimal('2') * scale_factor, base_y * scale_factor),
+            (trunk_w / Decimal('2') * scale_factor, base_y * scale_factor),
+            (trunk_w / Decimal('2') * scale_factor, trunk_bottom_y * scale_factor),
+            (-(trunk_w / Decimal('2')) * scale_factor, trunk_bottom_y * scale_factor),
+            (-(trunk_w / Decimal('2')) * scale_factor, base_y * scale_factor),
+            (-(base_w / Decimal('2')) * scale_factor, base_y * scale_factor),
+            (-(mid_w / Decimal('4')) * scale_factor, tier_2_y * scale_factor),
+            (-(mid_w / Decimal('2')) * scale_factor, tier_2_y * scale_factor),
+            (-(top_w / Decimal('4')) * scale_factor, tier_1_y * scale_factor),
+            (-(top_w / Decimal('2')) * scale_factor, tier_1_y * scale_factor),
+        ])
+        # Rotate + Translate
+        rotated = affinity.rotate(initial_polygon, float(self.angle), origin=(0, 0))
+        return affinity.translate(
+            rotated,
+            xoff=float(self.center_x * scale_factor),
+            yoff=float(self.center_y * scale_factor)
+        )
+
+    def clone(self) -> "ChristmasTree":
+        """Clone ChristmasTree object (avoid re-calculating polygon)"""
+        new_tree = ChristmasTree.__new__(ChristmasTree)
+        new_tree.center_x = self.center_x
+        new_tree.center_y = self.center_y
+        new_tree.angle = self.angle
+        new_tree.polygon = self.polygon
+        return new_tree
+
+# --- Helper Functions ---
+def get_tree_list_side_length_fast(polygons) -> float:
+    """Fast calculate max side length of polygon group's bounding box (restore scale factor)"""
+    if not polygons:
+        return 0.0
+    minx, miny, maxx, maxy = polygons[0].bounds
+    for p in polygons[1:]:
+        b = p.bounds
+        if b[0] < minx: minx = b[0]
+        if b[1] < miny: miny = b[1]
+        if b[2] > maxx: maxx = b[2]
+        if b[3] > maxy: maxy = b[3]
+    return max(maxx - minx, maxy - miny) / float(scale_factor)
+
+def validate_no_overlaps(polygons):
+    """Use spatial index to detect polygon area overlap (edge/point contact only allowed)"""
+    if not polygons:
         return True
-    return False
 
-@njit(cache=True)
-def check_poly_overlap(p1x, p1y, p2x, p2y, safety_margin):
-    minx1, miny1, maxx1, maxy1 = get_bounds(p1x, p1y)
-    minx2, miny2, maxx2, maxy2 = get_bounds(p2x, p2y)
-    if (minx1 > maxx2 + safety_margin or maxx1 < minx2 - safety_margin or 
-        miny1 > maxy2 + safety_margin or maxy1 < miny2 - safety_margin):
-        return False
-    for i in range(NUM_VERTS - 1):
-        if is_point_in_poly(p1x[i], p1y[i], p2x, p2y): return True
-    for i in range(NUM_VERTS - 1):
-        if is_point_in_poly(p2x[i], p2y[i], p1x, p1y): return True
-    for i in range(NUM_VERTS - 1):
-        for j in range(NUM_VERTS - 1):
-            if segments_intersect(p1x[i], p1y[i], p1x[i+1], p1y[i+1],
-                                  p2x[j], p2y[j], p2x[j+1], p2y[j+1]):
-                return True
-    return False
-
-@njit(cache=True)
-def get_system_score_raw(xs, ys, rots, n, temp_cache_x, temp_cache_y):
-    g_minx, g_miny = 1e9, 1e9
-    g_maxx, g_maxy = -1e9, -1e9
-    for i in range(n):
-        transform_poly(xs[i], ys[i], rots[i], temp_cache_x[i], temp_cache_y[i])
-        minx, miny, maxx, maxy = get_bounds(temp_cache_x[i], temp_cache_y[i])
-        if minx < g_minx: g_minx = minx
-        if miny < g_miny: g_miny = miny
-        if maxx > g_maxx: g_maxx = maxx
-        if maxy > g_maxy: g_maxy = maxy
-    w = g_maxx - g_minx
-    h = g_maxy - g_miny
-    side = w if w > h else h
-    return side * side
-
-# ==========================================
-# 3. STRICT SIMULATED ANNEALING
-# ==========================================
-
-@njit(cache=True)
-def run_strict_sa(xs, ys, rots, n, iterations, start_temp, cooling_rate, squeeze_factor, squeeze_freq, safety_margin):
-    cache_x = np.zeros((n, 16), dtype=np.float64)
-    cache_y = np.zeros((n, 16), dtype=np.float64)
-    for i in range(n):
-        transform_poly(xs[i], ys[i], rots[i], cache_x[i], cache_y[i])
-        
-    current_area = get_system_score_raw(xs, ys, rots, n, cache_x, cache_y)
-    best_area = current_area
-    best_xs = xs.copy()
-    best_ys = ys.copy()
-    best_rots = rots.copy()
-    
-    temp = start_temp
-    
-    # Calculate Center
-    g_minx, g_miny = 1e9, 1e9
-    g_maxx, g_maxy = -1e9, -1e9
-    for i in range(n):
-        minx, miny, maxx, maxy = get_bounds(cache_x[i], cache_y[i])
-        if minx < g_minx: g_minx = minx
-        if maxx > g_maxx: g_maxx = maxx
-        if miny < g_miny: g_miny = miny
-        if maxy > g_maxy: g_maxy = maxy
-    cx = (g_minx + g_maxx) / 2
-    cy = (g_miny + g_maxy) / 2
-
-    for k in range(iterations):
-        # 1. HYDRAULIC PRESS (Squeeze)
-        did_squeeze = False
-        if k % squeeze_freq == 0:
-            saved_xs = xs.copy()
-            saved_ys = ys.copy()
-            squeeze_valid = True
-            
-            # Pull towards center
-            for i in range(n):
-                xs[i] = cx + (xs[i] - cx) * squeeze_factor
-                ys[i] = cy + (ys[i] - cy) * squeeze_factor
-            
-            # Check validity
-            for i in range(n):
-                transform_poly(xs[i], ys[i], rots[i], cache_x[i], cache_y[i])
-            for i in range(n):
-                for j in range(i+1, n):
-                    if check_poly_overlap(cache_x[i], cache_y[i], cache_x[j], cache_y[j], safety_margin):
-                        squeeze_valid = False
-                        break
-                if not squeeze_valid: break
-            
-            if squeeze_valid:
-                did_squeeze = True
-                current_area = get_system_score_raw(xs, ys, rots, n, cache_x, cache_y)
-                if current_area < best_area:
-                    best_area = current_area
-                    best_xs = xs.copy()
-                    best_ys = ys.copy()
-                    best_rots = rots.copy()
+    strtree = STRtree(polygons)
+    for i, poly in enumerate(polygons):
+        candidates = strtree.query(poly)
+        for cand in candidates:
+            # Compatible with Shapely 1.8/2.x
+            if hasattr(cand, "geom_type"):
+                other = cand
+                if other is poly:
+                    continue
             else:
-                # Revert
-                xs[:] = saved_xs[:]
-                ys[:] = saved_ys[:]
-                for i in range(n):
-                    transform_poly(xs[i], ys[i], rots[i], cache_x[i], cache_y[i])
-
-        # 2. PERTURBATION
-        if not did_squeeze:
-            idx = np.random.randint(0, n)
-            old_x, old_y, old_rot = xs[idx], ys[idx], rots[idx]
-            
-            rnd = np.random.random()
-            mag = max(0.00000001, temp * 0.05) 
-            
-            if rnd < 0.5: 
-                xs[idx] += np.random.normal(0, mag)
-                ys[idx] += np.random.normal(0, mag)
-            elif rnd < 0.9: 
-                rots[idx] += np.random.normal(0, mag * 50.0) 
-            else: 
-                # Larger jumps to fix bad packing
-                if temp > 1.0:
-                    xs[idx] += np.random.normal(0, 0.5)
-                    ys[idx] += np.random.normal(0, 0.5)
-                    rots[idx] = np.random.uniform(0, 360)
-
-            tx = np.zeros(16, dtype=np.float64)
-            ty = np.zeros(16, dtype=np.float64)
-            transform_poly(xs[idx], ys[idx], rots[idx], tx, ty)
-            
-            valid = True
-            for j in range(n):
-                if idx == j: continue
-                if check_poly_overlap(tx, ty, cache_x[j], cache_y[j], safety_margin):
-                    valid = False
-                    break
-            
-            if valid:
-                cache_x[idx] = tx
-                cache_y[idx] = ty
-                new_area = get_system_score_raw(xs, ys, rots, n, cache_x, cache_y)
-                delta = new_area - current_area
-                
-                if delta < 0 or np.random.random() < np.exp(-delta / temp):
-                    current_area = new_area
-                    if current_area < best_area:
-                        best_area = current_area
-                        best_xs = xs.copy()
-                        best_ys = ys.copy()
-                        best_rots = rots.copy()
-                else:
-                    xs[idx] = old_x
-                    ys[idx] = old_y
-                    rots[idx] = old_rot
-                    transform_poly(old_x, old_y, old_rot, cache_x[idx], cache_y[idx])
-            else:
-                xs[idx] = old_x
-                ys[idx] = old_y
-                rots[idx] = old_rot
-
-        temp *= cooling_rate
-        if temp < 1e-12: temp = 1e-12
-
-    return best_xs, best_ys, best_rots, best_area
-
-# ==========================================
-# 4. INITIALIZATION & WRAPPER
-# ==========================================
-
-def get_base_shapely_poly():
-    X = [0, 0.125, 0.0625, 0.2, 0.1, 0.35, 0.075, 0.075, 
-         -0.075, -0.075, -0.35, -0.1, -0.2, -0.0625, -0.125, 0.0]
-    Y = [0.8, 0.5, 0.5, 0.25, 0.25, 0.0, 0.0, -0.2, 
-         -0.2, 0.0, 0.0, 0.25, 0.25, 0.5, 0.5, 0.8]
-    return Polygon(list(zip(X, Y)))
-
-BASE_SHAPELY = get_base_shapely_poly()
-
-def verify_validity(xs, ys, rots):
-    """Shapely verification."""
-    polys = []
-    n = len(xs)
-    for i in range(n):
-        p = affinity.rotate(BASE_SHAPELY, rots[i], origin=(0,0))
-        p = affinity.translate(p, xs[i], ys[i])
-        polys.append(p)
-    
-    for i in range(n):
-        p1 = polys[i].buffer(-1e-9) 
-        for j in range(i+1, n):
-            if p1.intersects(polys[j]):
+                j = int(cand)
+                if j == i:
+                    continue
+                other = polygons[j]
+            # Not disjoint and not only touching = area overlap
+            if (not poly.disjoint(other)) and (not poly.touches(other)):
                 return False
     return True
 
-def generate_grid_initialization(n):
-    """
-    Generates a safe, dispersed grid layout.
-    """
-    xs = np.zeros(n, dtype=np.float64)
-    ys = np.zeros(n, dtype=np.float64)
-    rots = np.zeros(n, dtype=np.float64)
-    ids = [f"{n}_{i}" for i in range(n)]
+def parse_csv(csv_path):
+    """Parse local CSV file, generate tree list grouped by group ID"""
+    if not os.path.exists(csv_path):
+        raise FileNotFoundError(f"Input file does not exist: {csv_path}")
     
-    # Calculate grid size
-    grid_side = math.ceil(math.sqrt(n))
-    spacing = 2.0  # Safe distance (Tree is ~1.0 high, 0.7 wide)
+    print(f'Loading CSV file: {csv_path}')
+    # Read CSV with specified encoding (avoid local Chinese garbled characters)
+    result = pd.read_csv(csv_path, encoding='utf-8')
     
-    for i in range(n):
-        row = i // grid_side
-        col = i % grid_side
-        
-        # Center the grid around 0,0 for easier squeezing
-        xs[i] = (col - grid_side/2) * spacing
-        ys[i] = (row - grid_side/2) * spacing
-        
-        # Random initial rotation
-        rots[i] = random.uniform(0, 360)
-        
-    return pd.DataFrame({'id': ids, 'x': xs, 'y': ys, 'deg': rots})
+    # Verify required columns exist
+    required_cols = ['id', 'x', 'y', 'deg']
+    missing_cols = [col for col in required_cols if col not in result.columns]
+    if missing_cols:
+        raise ValueError(f"CSV missing required columns: {missing_cols}")
+    
+    # Clean x/y/deg columns (remove possible 's' prefix)
+    for col in ['x', 'y', 'deg']:
+        if result[col].dtype == object:
+            result[col] = result[col].astype(str).str.strip('s')
+    
+    # Split id column into group_id and item_id
+    result[['group_id', 'item_id']] = result['id'].str.split('_', n=2, expand=True)
+    if result['group_id'].isnull().any():
+        raise ValueError("Invalid ID column format - must be 'group_id_item_id' (e.g., 1_0)")
+    
+    # Generate tree list by group
+    dict_of_tree_list = {}
+    for group_id, group_data in result.groupby('group_id'):
+        tree_list = [
+            ChristmasTree(center_x=str(row.x), center_y=str(row.y), angle=str(row.deg))
+            for row in group_data.itertuples(index=False)
+        ]
+        dict_of_tree_list[group_id] = tree_list
+    
+    print(f"CSV loaded successfully - {len(dict_of_tree_list)} tree groups found")
+    return dict_of_tree_list
 
-def optimize_from_scratch(n, params):
-    # 1. Generate Start State
-    df_init = generate_grid_initialization(n)
+def save_dict_to_csv(dict_of_tree_list, output_path):
+    """Save optimization results to local CSV file"""
+    print(f"Saving results to: {output_path}")
+    # Create output directory if not exists
+    output_dir = os.path.dirname(output_path)
+    if output_dir and not os.path.exists(output_dir):
+        os.makedirs(output_dir)
     
-    xs = np.ascontiguousarray(df_init['x'].values, dtype=np.float64)
-    ys = np.ascontiguousarray(df_init['y'].values, dtype=np.float64)
-    rots = np.ascontiguousarray(df_init['deg'].values, dtype=np.float64)
+    # Organize data
+    data = []
+    sorted_keys = sorted(dict_of_tree_list.keys(), key=lambda x: int(x))
+    for group_id in sorted_keys:
+        trees = dict_of_tree_list[group_id]
+        for i, tree in enumerate(trees):
+            data.append({
+                'id': f"{group_id}_{i}",
+                'x': f"s{tree.center_x}",
+                'y': f"s{tree.center_y}",
+                'deg': f"s{tree.angle}",
+            })
     
-    # JIT Warmup
-    if not hasattr(optimize_from_scratch, "compiled"):
-        run_strict_sa(xs.copy(), ys.copy(), rots.copy(), n, 10, 0.1, 0.9, 1.0, 100, 1e-7)
-        optimize_from_scratch.compiled = True
-        
-    best_xs, best_ys, best_rots, best_raw_area = run_strict_sa(
-        xs, ys, rots, n, 
-        iterations=params['ITERATIONS'], 
-        start_temp=params['START_TEMP'],
-        cooling_rate=params['COOLING_RATE'], 
-        squeeze_factor=params['SQUEEZE_FACTOR'],
-        squeeze_freq=params['SQUEEZE_FREQ'],
-        safety_margin=params['SAFETY_MARGIN']
-    )
-    
-    # Final Check
-    if not verify_validity(best_xs, best_ys, best_rots):
-        return None, float('inf')
-    
-    res_data = []
-    for i in range(n):
-        res_data.append({
-            'id': df_init.iloc[i]['id'],
-            'x': best_xs[i],
-            'y': best_ys[i],
-            'deg': best_rots[i]
-        })
-        
-    final_score = best_raw_area / n
-    return pd.DataFrame(res_data), final_score
+    # Save CSV (specify encoding)
+    df = pd.DataFrame(data)[['id', 'x', 'y', 'deg']]
+    df.to_csv(output_path, index=False, encoding='utf-8')
+    print(f"Save completed! File path: {output_path}")
 
-def main():
-    # =====================
-    # CONFIGURATION
-    # =====================
-    output_file = 'C:/Users/user/Downloads/submission_from_scratch.csv'
-    
-    # WHICH N TO SOLVE?
-    TARGET_NS = [16] 
-    
-    # HOW MANY RESTARTS?
-    LOOPS_PER_N = 10
-    
-    PARAMS = {
-        'ITERATIONS': 500_000,    # Increase because we start far apart
-        'START_TEMP': 5.0,       # High temp to bring them together fast
-        'COOLING_RATE': 0.99998,  # Slow cool for packing
-        'SQUEEZE_FACTOR': 0.999,  # Slightly more aggressive squeeze initally
-        'SQUEEZE_FREQ': 50,       # Frequent squeezing
-        'SAFETY_MARGIN': 1e-20
-    }
-    # =====================
-    
-    final_dfs = []
-    
-    print(f"Generating and Optimizing for N = {TARGET_NS}")
-    print(f"{'N':<5} | {'Loop':<5} | {'Best Score':<15} | {'Status'}")
-    print("-" * 50)
-    
-    for n in TARGET_NS:
-        
-        best_df_for_n = None
-        best_score_for_n = float('inf')
-        
-        for i in range(LOOPS_PER_N):
-            # Run optimization from fresh random grid
-            opt_df, new_score = optimize_from_scratch(n, PARAMS)
-            
-            status = "Discarded"
-            if opt_df is not None:
-                if new_score < best_score_for_n:
-                    best_score_for_n = new_score
-                    best_df_for_n = opt_df
-                    status = "NEW BEST"
-                else:
-                    status = "Valid (Worse)"
-            else:
-                status = "Invalid"
-                
-            print(f"{n:<5} | {i+1}/{LOOPS_PER_N} | {best_score_for_n:.8f}    | {status}")
-            
-        if best_df_for_n is not None:
-            final_dfs.append(best_df_for_n)
-            print(f"--> Finished N={n}. Final Score: {best_score_for_n:.8f}\n")
-        else:
-            print(f"--> Failed to find valid solution for N={n} (Check params)\n")
+# --- Core Simulated Annealing Function ---
+def run_simulated_annealing(args):
+    """Simulated annealing optimization for single tree group (multiprocessing task)"""
+    group_id, initial_trees, max_iterations, t_start, t_end = args
+    n_trees = len(initial_trees)
 
-    # Save
-    if final_dfs:
-        final_df = pd.concat(final_dfs).sort_values('id')
-        
-        # Format
-        for col in ['x', 'y', 'deg']:
-            final_df[col] = final_df[col].apply(lambda x: f"s{x:.20f}")
-            
-        final_df = final_df[['id', 'x', 'y', 'deg']]
-        final_df.to_csv(output_file, index=False)
-        print(f"Saved to: {output_file}")
+    # Adjust parameters based on number of trees
+    is_small_n = n_trees <= 100
+    if is_small_n:
+        effective_max_iter = max_iterations * 3
+        effective_t_start = t_start * 2.0
+        gravity_weight = 1e-4
     else:
-        print("No valid solutions found.")
+        effective_max_iter = max_iterations
+        effective_t_start = t_start
+        gravity_weight = 1e-6
 
-if __name__ == "__main__":
+    # Initialize state (Decimal to float for faster calculation)
+    state = []
+    for t in initial_trees:
+        cx_float = float(t.center_x) * float(scale_factor)
+        cy_float = float(t.center_y) * float(scale_factor)
+        state.append({
+            'poly': t.polygon,
+            'cx': cx_float,
+            'cy': cy_float,
+            'angle': float(t.angle),
+        })
+
+    current_polys = [s['poly'] for s in state]
+    current_bounds = [p.bounds for p in current_polys]
+    scale_f = float(scale_factor)
+    inv_scale_f = 1.0 / scale_f
+    inv_scale_f2 = 1.0 / (scale_f * scale_f)
+
+    # Helper function: Calculate overall bounding box
+    def _envelope_from_bounds(bounds_list):
+        if not bounds_list:
+            return (0.0, 0.0, 0.0, 0.0)
+        minx, miny, maxx, maxy = bounds_list[0]
+        for b in bounds_list[1:]:
+            if b[0] < minx: minx = b[0]
+            if b[1] < miny: miny = b[1]
+            if b[2] > maxx: maxx = b[2]
+            if b[3] > maxy: maxy = b[3]
+        return (minx, miny, maxx, maxy)
+
+    def _envelope_from_bounds_replace(bounds_list, replace_i: int, replace_bounds):
+        """Incremental update of bounding box"""
+        if not bounds_list:
+            return (0.0, 0.0, 0.0, 0.0)
+        b0 = replace_bounds if replace_i == 0 else bounds_list[0]
+        minx, miny, maxx, maxy = b0
+        for i, b in enumerate(bounds_list[1:], start=1):
+            if i == replace_i:
+                b = replace_bounds
+            if b[0] < minx: minx = b[0]
+            if b[1] < miny: miny = b[1]
+            if b[2] > maxx: maxx = b[2]
+            if b[3] > maxy: maxy = b[3]
+        return (minx, miny, maxx, maxy)
+
+    def _side_len_from_env(env):
+        minx, miny, maxx, maxy = env
+        return max(maxx - minx, maxy - miny) * inv_scale_f
+
+    # Initialize bounding box and distance sum
+    env = _envelope_from_bounds(current_bounds)
+    dist_sum = 0.0
+    for s in state:
+        dist_sum += s['cx'] * s['cx'] + s['cy'] * s['cy']
+
+    # Energy function: Bounding box side length + gravity penalty (avoid trees moving away from center)
+    def energy_from(env_local, dist_sum_local):
+        side_len = _side_len_from_env(env_local)
+        normalized_dist = (dist_sum_local * inv_scale_f2) / max(1, n_trees)
+        return side_len + gravity_weight * normalized_dist, side_len
+
+    current_energy, current_side_len = energy_from(env, dist_sum)
+    best_state_params = [{'cx': s['cx'], 'cy': s['cy'], 'angle': s['angle']} for s in state]
+    best_real_score = current_side_len
+
+    # Simulated annealing cooling configuration
+    T = effective_t_start
+    cooling_rate = math.pow(t_end / effective_t_start, 1.0 / effective_max_iter)
+
+    # Core iteration
+    for i in range(effective_max_iter):
+        progress = i / effective_max_iter
+        # Dynamically adjust perturbation scale
+        if is_small_n:
+            move_scale = max(0.001, 1.0 * (1 - progress))
+            rotate_scale = max(0.0005, 1.5 * (1 - progress))
+        else:
+            move_scale = max(0.0005, 0.5 * (T / effective_t_start))
+            rotate_scale = max(0.0005, 3.0 * (T / effective_t_start))
+
+        # Randomly select one tree for perturbation
+        idx = random.randint(0, n_trees - 1)
+        target = state[idx]
+        orig_poly = target['poly']
+        orig_bounds = current_bounds[idx]
+        orig_cx, orig_cy, orig_angle = target['cx'], target['cy'], target['angle']
+
+        # Generate random perturbation
+        dx = (random.random() - 0.5) * scale_f * 0.1 * move_scale
+        dy = (random.random() - 0.5) * scale_f * 0.1 * move_scale
+        d_angle = (random.random() - 0.5) * rotate_scale
+
+        # Apply rotation and translation
+        rotated_poly = affinity.rotate(orig_poly, d_angle, origin=(orig_cx, orig_cy))
+        new_poly = affinity.translate(rotated_poly, xoff=dx, yoff=dy)
+        new_bounds = new_poly.bounds
+        new_cx = orig_cx + dx
+        new_cy = orig_cy + dy
+        new_angle = orig_angle + d_angle
+
+        # Collision detection
+        collision = False
+        for k in range(n_trees):
+            if k == idx:
+                continue
+            ox1, oy1, ox2, oy2 = current_bounds[k]
+            if new_bounds[0] > ox2 or new_bounds[2] < ox1 or new_bounds[1] > oy2 or new_bounds[3] < oy1:
+                continue
+            other = current_polys[k]
+            if (not new_poly.disjoint(other)) and (not new_poly.touches(other)):
+                collision = True
+                break
+        if collision:
+            T *= cooling_rate
+            continue
+
+        # Calculate new energy
+        old_d = orig_cx * orig_cx + orig_cy * orig_cy
+        new_d = new_cx * new_cx + new_cy * new_cy
+        cand_dist_sum = dist_sum - old_d + new_d
+
+        # Incremental update of bounding box
+        env_minx, env_miny, env_maxx, env_maxy = env
+        need_recompute = (
+            (orig_bounds[0] == env_minx and new_bounds[0] > env_minx) or
+            (orig_bounds[1] == env_miny and new_bounds[1] > env_miny) or
+            (orig_bounds[2] == env_maxx and new_bounds[2] < env_maxx) or
+            (orig_bounds[3] == env_maxy and new_bounds[3] < env_maxy)
+        )
+        if need_recompute:
+            cand_env = _envelope_from_bounds_replace(current_bounds, idx, new_bounds)
+        else:
+            cand_env = (
+                min(env_minx, new_bounds[0]),
+                min(env_miny, new_bounds[1]),
+                max(env_maxx, new_bounds[2]),
+                max(env_maxy, new_bounds[3]),
+            )
+
+        new_energy, new_real_score = energy_from(cand_env, cand_dist_sum)
+        delta = new_energy - current_energy
+
+        # Metropolis criterion to accept new state
+        accept = False
+        if delta < 0:
+            accept = True
+        else:
+            if T > 1e-10:
+                prob = math.exp(-delta * 1000 / T)
+                accept = random.random() < prob
+
+        if accept:
+            current_polys[idx] = new_poly
+            current_bounds[idx] = new_bounds
+            target['poly'] = new_poly
+            target['cx'] = new_cx
+            target['cy'] = new_cy
+            target['angle'] = new_angle
+
+            current_energy = new_energy
+            env = cand_env
+            dist_sum = cand_dist_sum
+
+            if new_real_score < best_real_score:
+                best_real_score = new_real_score
+                for k in range(n_trees):
+                    best_state_params[k]['cx'] = state[k]['cx']
+                    best_state_params[k]['cy'] = state[k]['cy']
+                    best_state_params[k]['angle'] = state[k]['angle']
+
+        T *= cooling_rate
+
+    # Generate final results
+    final_trees = []
+    final_polys_check = []
+    for p in best_state_params:
+        cx_dec = Decimal(p['cx']) / scale_factor
+        cy_dec = Decimal(p['cy']) / scale_factor
+        angle_dec = Decimal(p['angle'])
+        new_t = ChristmasTree(str(cx_dec), str(cy_dec), str(angle_dec))
+        final_trees.append(new_t)
+        final_polys_check.append(new_t.polygon)
+
+    # Final validation: return original trees if overlap exists
+    if not validate_no_overlaps(final_polys_check):
+        orig_score = get_tree_list_side_length_fast([t.polygon for t in initial_trees])
+        return group_id, initial_trees, orig_score
+
+    return group_id, final_trees, best_real_score
+
+# --- Main Function (Local Run Entry) ---
+def main():
+    print("="*50)
+    print("Christmas Tree Layout Optimization (Local Version)")
+    print("="*50)
+    
+    # Convert time limit to seconds
+    time_limit_sec = LOCAL_TIME_LIMIT_HOURS * 3600 if LOCAL_TIME_LIMIT_HOURS > 0 else float('inf')
+    
+    try:
+        # 1. Read input CSV
+        dict_of_tree_list = parse_csv(INPUT_CSV)
+        
+        # 2. Generate optimization tasks
+        groups_to_optimize = sorted(dict_of_tree_list.keys(), key=lambda x: int(x), reverse=True)
+        tasks = []
+        for gid in groups_to_optimize:
+            tasks.append((gid, dict_of_tree_list[gid], MAX_ITER_PER_GROUP, T_START, T_END))
+        
+        # 3. Configure multiprocessing
+        num_processes = multiprocessing.cpu_count() - 1  # Leave 1 core for system
+        num_processes = max(1, num_processes)  # At least 1 process
+        print(f"\nOptimization Configuration:")
+        print(f"- Number of tree groups to optimize: {len(tasks)}")
+        print(f"- Number of processes enabled: {num_processes}")
+        print(f"- Max iterations per group: {MAX_ITER_PER_GROUP}")
+        print(f"- Runtime limit: {LOCAL_TIME_LIMIT_HOURS} hours (0 = no limit)")
+        print(f"- Auto-save interval: Every {SAVE_EVERY_N_GROUPS} groups")
+        print(f"- Press Ctrl+C to interrupt manually and save progress\n")
+
+        # 4. Initialize monitoring variables
+        start_time = time.time()
+        improved_count = 0
+        total_tasks = len(tasks)
+        finished_tasks = 0
+
+        # 5. Start multiprocessing pool
+        pool = multiprocessing.Pool(processes=num_processes)
+        results_iter = pool.imap_unordered(run_simulated_annealing, tasks, chunksize=CHUNKSIZE)
+
+        # 6. Process optimization results
+        for result in results_iter:
+            group_id, optimized_trees, score = result
+            finished_tasks += 1
+
+            # Calculate original score
+            orig_polys = [t.polygon for t in dict_of_tree_list[group_id]]
+            orig_score = get_tree_list_side_length_fast(orig_polys)
+
+            # Check if optimization succeeded
+            status_msg = ""
+            if score < orig_score and (orig_score - score) > 1e-12:
+                status_msg = f" -> Optimization succeeded! (-{(orig_score - score):.6f})"
+                dict_of_tree_list[group_id] = optimized_trees
+                improved_count += 1
+
+            # Check time limit
+            elapsed_time = time.time() - start_time
+            if elapsed_time > time_limit_sec:
+                print(f"\n[WARNING] Time limit reached ({elapsed_time/3600:.2f} hours), stopping optimization and saving...")
+                pool.terminate()
+                break
+
+            # Auto-save progress
+            if finished_tasks % SAVE_EVERY_N_GROUPS == 0:
+                print(f"\n[Auto-save] Completed {finished_tasks}/{total_tasks} groups...")
+                save_dict_to_csv(dict_of_tree_list, OUTPUT_CSV)
+
+            # Print progress
+            print(f"[{finished_tasks}/{total_tasks}] Group {group_id}: {orig_score:.5f} -> {score:.5f} {status_msg}")
+
+        # All tasks completed normally
+        pool.close()
+        pool.join()
+        print(f"All optimization tasks completed! Total runtime: {time.time()-start_time:.2f} seconds")
+
+    except KeyboardInterrupt:
+        # Manual interruption (Ctrl+C)
+        print("Manual interruption detected (Ctrl+C), saving current progress...")
+        if 'pool' in locals():
+            pool.terminate()
+            pool.join()
+    except Exception as e:
+        # Other errors
+        print(f"Runtime error: {type(e).__name__} - {str(e)}")
+        print(f"Detailed error information:\n{format_exc()}")
+    finally:
+        # Final save results
+        if 'dict_of_tree_list' in locals():
+            print(f"Saving final results...")
+            save_dict_to_csv(dict_of_tree_list, OUTPUT_CSV)
+            print(f"Optimization Statistics:")
+            print(f"- Total groups: {len(dict_of_tree_list)}")
+            print(f"- Successfully optimized groups: {improved_count}")
+        print("\nProgram finished!")
+        print("="*50)
+
+if __name__ == '__main__':
+    # Windows multiprocessing compatibility
+    multiprocessing.freeze_support()
     main()
+
+# Run Instructions:
+# 1. Modify the "Local Run Parameter Configuration" section with your actual paths and parameters
+# 2. Ensure input CSV format is correct (contains id/x/y/deg columns, id format: group_id_item_id)
+# 3. Install dependencies: pip install pandas shapely
+# 4. Run the script directly
