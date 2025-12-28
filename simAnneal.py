@@ -26,9 +26,9 @@ scale_factor = Decimal('1e18')
 
 # --- Configuration Parameters ---
 # input output csv; max iter per grp; temp start/end; time limit hrs; save freq; chunk size
-INPUT_CSV = r"C:\Users\user\OneDrive\Desktop\Python Folder\kaggle\Scores\sample_submission.csv"
-OUTPUT_CSV = r"C:\Users\user\OneDrive\Desktop\Python Folder\kaggle\submission_sa (1).csv"  
-MAX_ITER_PER_GROUP = 500000  
+INPUT_CSV = r"C:/Users/user/Downloads/submission (59).csv"
+OUTPUT_CSV = r"C:/Users/user/Downloads/submission (60).csv"  
+MAX_ITER_PER_GROUP = 2500000  
 T_START = 3  
 T_END = 0.001  
 LOCAL_TIME_LIMIT_HOURS = 0  
@@ -418,6 +418,10 @@ def main():
         groups_to_optimize = sorted(dict_of_tree_list.keys(), key=lambda x: int(x), reverse=True)
         tasks = []
         for gid in groups_to_optimize:
+            # === ADD THIS BLOCK ===
+            if not (1 <= int(gid) <= 50):  #CHANGE HERE!!!!!!!!
+                continue
+            # ======================
             tasks.append((gid, dict_of_tree_list[gid], MAX_ITER_PER_GROUP, T_START, T_END))
         
         # 3. Configure multiprocessing
